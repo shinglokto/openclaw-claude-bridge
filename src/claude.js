@@ -3,6 +3,61 @@
 const { spawn } = require('child_process');
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+const PREFIXES = ['Chat', 'Dev', 'Run', 'Ask', 'Net', 'App', 'Zen', 'Arc', 'Dot', 'Amp', 'Hex', 'Orb', 'Elm', 'Oak', 'Sky'];
+const SUFFIXES = ['Kit', 'Box', 'Pod', 'Hub', 'Lab', 'Ops', 'Bay', 'Tap', 'Rim', 'Fog', 'Dew', 'Fin', 'Gem', 'Jet', 'Cog'];
+const sessionAliasMap = new Map();
+
+function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function pick(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function createAliasPair() {
+    const alias = pick(PREFIXES) + pick(SUFFIXES);
+    return { alias, aliasLower: alias.toLowerCase() };
+}
+
+function getAliasPair(sessionId) {
+    if (!sessionId) return createAliasPair();
+    let pair = sessionAliasMap.get(sessionId);
+    if (!pair) {
+        pair = createAliasPair();
+        sessionAliasMap.set(sessionId, pair);
+    }
+    return pair;
+}
+
+function mapStringsDeep(value, replacer) {
+    if (typeof value === 'string') return replacer(value);
+    if (Array.isArray(value)) return value.map((item) => mapStringsDeep(item, replacer));
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(
+            Object.entries(value).map(([key, item]) => [key, mapStringsDeep(item, replacer)])
+        );
+    }
+    return value;
+}
+
+function replaceOutboundOpenClaw(value, aliasPair) {
+    return mapStringsDeep(value, (text) => text
+        .replace(/OpenClaw/g, aliasPair.alias)
+        .replace(/openclaw/g, aliasPair.aliasLower));
+}
+
+function replaceInboundAliases(value) {
+    return mapStringsDeep(value, (text) => {
+        let next = text;
+        for (const { alias, aliasLower } of sessionAliasMap.values()) {
+            next = next
+                .replace(new RegExp(escapeRegExp(alias), 'g'), 'OpenClaw')
+                .replace(new RegExp(escapeRegExp(aliasLower), 'g'), 'openclaw');
+        }
+        return next;
+    });
+}
 
 /**
  * Map OpenClaw model IDs to Claude CLI model names.
@@ -58,22 +113,11 @@ function mapEffort(reasoningEffort) {
 }
 
 function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoningEffort, sessionId, isResume) {
-    // Bidirectional harness-name substitution to avoid billing reclassification.
-    // Generates a random two-part product name from common English words.
-    // Each part is too generic to blocklist without breaking legitimate usage.
-    const PREFIXES = ['Chat', 'Dev', 'Run', 'Ask', 'Net', 'App', 'Zen', 'Arc', 'Dot', 'Amp', 'Hex', 'Orb', 'Elm', 'Oak', 'Sky'];
-    const SUFFIXES = ['Kit', 'Box', 'Pod', 'Hub', 'Lab', 'Ops', 'Bay', 'Tap', 'Rim', 'Fog', 'Dew', 'Fin', 'Gem', 'Jet', 'Cog'];
-    const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-    const alias = pick(PREFIXES) + pick(SUFFIXES);
-    const aliasLower = alias.toLowerCase();
-    if (systemPrompt) {
-        systemPrompt = systemPrompt
-            .replace(/OpenClaw/g, alias)
-            .replace(/openclaw/g, aliasLower);
-    }
-    promptText = promptText
-        .replace(/OpenClaw/g, alias)
-        .replace(/openclaw/g, aliasLower);
+    // Use one stable alias per Claude session so resumed sessions do not accumulate
+    // multiple replacement names that only partially map back on the next response.
+    const aliasPair = getAliasPair(sessionId);
+    if (systemPrompt) systemPrompt = replaceOutboundOpenClaw(systemPrompt, aliasPair);
+    promptText = replaceOutboundOpenClaw(promptText, aliasPair);
 
     return new Promise((resolve, reject) => {
         const model = resolveModel(modelId);
@@ -203,11 +247,7 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
                 reject(new Error(`Claude exited with code ${code}`));
             } else {
                 // Inbound: restore alias → openclaw
-                if (fullText) {
-                    fullText = fullText
-                        .replace(new RegExp(alias, 'g'), 'OpenClaw')
-                        .replace(new RegExp(aliasLower, 'g'), 'openclaw');
-                }
+                if (fullText) fullText = replaceInboundAliases(fullText);
                 resolve({ text: fullText, usage: fullUsage });
             }
         });
