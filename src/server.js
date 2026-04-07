@@ -6,7 +6,7 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { convertMessages, convertMessagesCompact, extractNewMessages, extractNewUserMessages } = require('./convert');
 const { buildToolInstructions } = require('./tools');
-const { runClaude, getContextWindow } = require('./claude');
+const { runClaude, getContextWindow, clearSessionAlias } = require('./claude');
 
 // --- Session cleanup ---
 // Claude CLI subprocess runs with cwd=/tmp. On macOS /tmp → /private/tmp,
@@ -217,6 +217,7 @@ function extractAgentName(messages) {
  * Also delete the CLI session file from disk.
  */
 function purgeCliSession(cliSessionId) {
+    clearSessionAlias(cliSessionId);
     // Clean sessionMap
     for (const [key, val] of sessionMap) {
         if (val.sessionId === cliSessionId) sessionMap.delete(key);

@@ -4,6 +4,42 @@ const { spawn } = require('child_process');
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
+// --- Stable alias per CLI session ---
+// Each session keeps one alias so resumed requests don't accumulate different
+// names in the Claude context (which would leak un-replaced aliases in output).
+const PREFIXES = ['Chat', 'Dev', 'Run', 'Ask', 'Net', 'App', 'Zen', 'Arc', 'Dot', 'Amp', 'Hex', 'Orb', 'Elm', 'Oak', 'Sky'];
+const SUFFIXES = ['Kit', 'Box', 'Pod', 'Hub', 'Lab', 'Ops', 'Bay', 'Tap', 'Rim', 'Fog', 'Dew', 'Fin', 'Gem', 'Jet', 'Cog'];
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const sessionAliasMap = new Map(); // sessionId → { alias, aliasLower, lastUsed }
+
+function getSessionAlias(sessionId) {
+    if (!sessionId) {
+        const alias = pick(PREFIXES) + pick(SUFFIXES);
+        return { alias, aliasLower: alias.toLowerCase() };
+    }
+    let entry = sessionAliasMap.get(sessionId);
+    if (entry) {
+        entry.lastUsed = Date.now();
+        return entry;
+    }
+    const alias = pick(PREFIXES) + pick(SUFFIXES);
+    entry = { alias, aliasLower: alias.toLowerCase(), lastUsed: Date.now() };
+    sessionAliasMap.set(sessionId, entry);
+    return entry;
+}
+
+function clearSessionAlias(sessionId) {
+    sessionAliasMap.delete(sessionId);
+}
+
+// Evict stale entries every 10 min (unused >1h)
+setInterval(() => {
+    const cutoff = Date.now() - 3600_000;
+    for (const [id, e] of sessionAliasMap) {
+        if (e.lastUsed < cutoff) sessionAliasMap.delete(id);
+    }
+}, 600_000).unref();
+
 /**
  * Map OpenClaw model IDs to Claude CLI model names.
  * Uses CLI aliases (opus/sonnet/haiku) by default so we always get the latest
@@ -58,14 +94,8 @@ function mapEffort(reasoningEffort) {
 }
 
 function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoningEffort, sessionId, isResume) {
-    // Bidirectional harness-name substitution to avoid billing reclassification.
-    // Generates a random two-part product name from common English words.
-    // Each part is too generic to blocklist without breaking legitimate usage.
-    const PREFIXES = ['Chat', 'Dev', 'Run', 'Ask', 'Net', 'App', 'Zen', 'Arc', 'Dot', 'Amp', 'Hex', 'Orb', 'Elm', 'Oak', 'Sky'];
-    const SUFFIXES = ['Kit', 'Box', 'Pod', 'Hub', 'Lab', 'Ops', 'Bay', 'Tap', 'Rim', 'Fog', 'Dew', 'Fin', 'Gem', 'Jet', 'Cog'];
-    const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-    const alias = pick(PREFIXES) + pick(SUFFIXES);
-    const aliasLower = alias.toLowerCase();
+    // Stable alias per session — see getSessionAlias() above.
+    const { alias, aliasLower } = getSessionAlias(sessionId);
     if (systemPrompt) {
         systemPrompt = systemPrompt
             .replace(/OpenClaw/g, alias)
@@ -248,4 +278,4 @@ function handleEvent(event, onChunk, setFull, setUsage) {
     }
 }
 
-module.exports = { runClaude, getContextWindow };
+module.exports = { runClaude, getContextWindow, clearSessionAlias };
