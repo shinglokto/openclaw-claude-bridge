@@ -302,6 +302,7 @@ function cleanResponseText(text) {
         .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
         .replace(/<tool_result[\s\S]*?<\/tool_result>/g, '')
         .replace(/<previous_response>[\s\S]*?<\/previous_response>/g, '')
+        .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
 
