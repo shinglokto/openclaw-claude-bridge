@@ -291,10 +291,13 @@ function parseToolCalls(text) {
                 console.error(`[parseToolCalls] Invalid tool_call payload: ${jsonText.slice(0, 300)}`);
                 continue;
             }
+            const args = (parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments))
+                ? parsed.arguments
+                : {};
             calls.push({
                 id: `call_${uuidv4().slice(0, 8)}`,
                 name: parsed.name,
-                arguments: parsed.arguments || {},
+                arguments: args,
             });
         } catch (err) {
             console.error(`[parseToolCalls] Failed to parse JSON: ${jsonText.slice(0, 300)}`);
