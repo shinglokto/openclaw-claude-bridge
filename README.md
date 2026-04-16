@@ -289,6 +289,7 @@ openclaw-claude-bridge/
 - **Port 3456** binds to localhost only — not reachable from outside the machine
 - **Port 3458** is LAN-accessible, protected by HTTP Basic Auth when `DASHBOARD_PASS` is set
 - **`--tools ""`** disables all Claude native tools — no host command execution
+- **`--strict-mcp-config`** disables all MCP servers — no host MCP leak into the bridged session
 - **`--dangerously-skip-permissions`** is required for headless operation (no terminal to prompt for confirmation; safe because native tools are disabled)
 - **`.env`** contains secrets and is gitignored
 

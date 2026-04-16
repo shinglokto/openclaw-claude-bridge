@@ -238,6 +238,8 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
 
         // Always disable native tools (CLI flag, not session property)
         args.push('--tools', '');
+        // Block user MCP servers from leaking into Claude's tool context
+        args.push('--strict-mcp-config');
 
         // Map OC reasoning_effort → Claude CLI --effort
         const effort = mapEffort(reasoningEffort);
