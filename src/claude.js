@@ -2,6 +2,7 @@
 
 const { spawn } = require('child_process');
 const crypto = require('crypto');
+const { NOSCRUB_OPEN, NOSCRUB_CLOSE } = require('./convert');
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -48,15 +49,14 @@ setInterval(() => {
 
 /**
  * Map OpenClaw model IDs to Claude CLI model names.
- * Uses CLI aliases (opus/sonnet/haiku) by default so we always get the latest
- * model without code changes.  Override via env vars in .env if needed,
- * e.g. OPUS_MODEL=opus[1m] when 1M context becomes available.
+ * Exposes explicit Anthropic-style model ids.
  */
 function resolveModel(modelId) {
     const modelMap = {
-        'claude-opus-latest':    process.env.OPUS_MODEL   || 'opus',
-        'claude-sonnet-latest':  process.env.SONNET_MODEL || 'sonnet',
-        'claude-haiku-latest':   process.env.HAIKU_MODEL  || 'haiku',
+        'claude-opus-4-7':      process.env.OPUS_47_MODEL || 'claude-opus-4-7',
+        'claude-opus-4-6':      process.env.OPUS_MODEL || 'claude-opus-4-6',
+        'claude-sonnet-4-6':    process.env.SONNET_MODEL || 'claude-sonnet-4-6',
+        'claude-haiku-4-5':     process.env.HAIKU_MODEL || 'claude-haiku-4-5',
     };
     return modelMap[modelId] || modelId;
 }
@@ -200,18 +200,67 @@ function restoreInbound(text, alias, aliasLower, sessionId) {
     return text;
 }
 
-function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoningEffort, sessionId, isResume) {
+
+/**
+ * Apply brand substitution (OpenClaw -> alias, openclaw -> aliasLower) to all
+ * regions of `text` EXCEPT those wrapped in NOSCRUB_OPEN/NOSCRUB_CLOSE
+ * sentinels. Sentinels are stripped from the returned string.
+ *
+ * Used so tool_call JSON args and tool_result payloads — which contain
+ * literal on-disk data the orchestrator owns (file paths, command output,
+ * identifiers) — pass through to Claude verbatim while surrounding
+ * user/assistant prose still gets brand-substituted.
+ *
+ * Preserves the prior `promptText` scope: brand-only, no pattern token
+ * scrubbing. systemPrompt continues to go through the heavier scrubOutbound.
+ */
+function brandSubstituteWithSkipRegions(text, alias, aliasLower) {
+    if (!text) return text;
+    const apply = (chunk) => chunk
+        .replace(/OpenClaw/g, alias)
+        .replace(/openclaw/g, aliasLower);
+    if (!text.includes(NOSCRUB_OPEN)) {
+        return apply(text);
+    }
+    const out = [];
+    let i = 0;
+    while (i < text.length) {
+        const openIdx = text.indexOf(NOSCRUB_OPEN, i);
+        if (openIdx === -1) {
+            out.push(apply(text.slice(i)));
+            break;
+        }
+        if (openIdx > i) {
+            out.push(apply(text.slice(i, openIdx)));
+        }
+        const closeIdx = text.indexOf(NOSCRUB_CLOSE, openIdx + NOSCRUB_OPEN.length);
+        if (closeIdx === -1) {
+            // Malformed sentinel pair — fail safe by brand-substituting the
+            // rest with the open marker stripped, so brand strings never leak
+            // unsubstituted when the structure is broken.
+            out.push(apply(text.slice(openIdx + NOSCRUB_OPEN.length)));
+            break;
+        }
+        out.push(text.slice(openIdx + NOSCRUB_OPEN.length, closeIdx));
+        i = closeIdx + NOSCRUB_CLOSE.length;
+    }
+    return out.join('');
+}
+
+function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoningEffort, sessionId, isResume, attachmentBlocks) {
     // Stable alias per session — see getSessionAlias() above.
     const { alias, aliasLower } = getSessionAlias(sessionId);
     if (systemPrompt) {
         systemPrompt = scrubOutbound(systemPrompt, alias, aliasLower, sessionId);
     }
-    promptText = promptText
-        .replace(/OpenClaw/g, alias)
-        .replace(/openclaw/g, aliasLower);
+    promptText = brandSubstituteWithSkipRegions(promptText, alias, aliasLower);
 
     return new Promise((resolve, reject) => {
         const model = resolveModel(modelId);
+
+        // Stream-json input mode is required when we have attachment blocks
+        // (images/PDFs) — the CLI doesn't accept attachments in text mode.
+        const hasAttachments = Array.isArray(attachmentBlocks) && attachmentBlocks.length > 0;
 
         const args = [
             '--print',
@@ -219,6 +268,9 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
             '--output-format', 'stream-json',
             '--verbose',
         ];
+        if (hasAttachments) {
+            args.push('--input-format', 'stream-json');
+        }
 
         // Always pass --model (not persisted in session)
         args.push('--model', model);
@@ -236,8 +288,11 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
             args.push('--system-prompt', systemPrompt);
         }
 
-        // Always disable native tools (CLI flag, not session property)
+        // Always disable Claude built-in tools. Also force MCP isolation so
+        // ambient local MCP servers cannot leak into the bridge session and
+        // bypass OpenClaw's tool loop.
         args.push('--tools', '');
+        args.push('--strict-mcp-config');
 
         // Map OC reasoning_effort → Claude CLI --effort
         const effort = mapEffort(reasoningEffort);
@@ -289,12 +344,35 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
         const hardTimer = setTimeout(() => kill(`Hard timeout (${MAX_RUN_MS / 60000}min)`), MAX_RUN_MS);
 
         // Write conversation to stdin
-        proc.stdin.write(promptText);
+        if (hasAttachments) {
+            // Stream-json input: one user message with text + image/document blocks.
+            // The prior conversation transcript is embedded as a single big text
+            // block; the attachments come last so they're clearly the "current"
+            // input the user is asking about.
+            const contentBlocks = [];
+            if (promptText) {
+                contentBlocks.push({ type: 'text', text: promptText });
+            }
+            for (const b of attachmentBlocks) {
+                contentBlocks.push(b);
+            }
+            const streamMsg = {
+                type: 'user',
+                message: {
+                    role: 'user',
+                    content: contentBlocks,
+                },
+            };
+            proc.stdin.write(JSON.stringify(streamMsg) + '\n');
+        } else {
+            proc.stdin.write(promptText);
+        }
         proc.stdin.end();
 
         let fullText = '';
         let fullUsage = { input_tokens: 0, output_tokens: 0 };
         let buffer = '';
+        let stderrText = '';
 
         proc.stdout.on('data', (chunk) => {
             resetIdle(); // Claude is alive — reset idle timer
@@ -317,7 +395,10 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
 
         proc.stderr.on('data', (data) => {
             const msg = data.toString().trim();
-            if (msg) console.error(`[claude stderr] ${msg}`);
+            if (msg) {
+                stderrText += (stderrText ? '\n' : '') + msg;
+                console.error(`[claude stderr] ${msg}`);
+            }
         });
 
         proc.on('close', (code) => {
@@ -334,8 +415,13 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
                 } catch {}
             }
 
-            if (code !== 0 && !fullText) {
-                reject(new Error(`Claude exited with code ${code}`));
+            const text = typeof fullText === 'string' ? fullText.trim() : '';
+            const detail = stderrText ? `: ${stderrText.split('\n').slice(-3).join(' | ')}` : '';
+
+            if (code !== 0 && !text) {
+                reject(new Error(`Claude exited with code ${code}${detail}`));
+            } else if (!text && (fullUsage.output_tokens ?? 0) === 0) {
+                reject(new Error(`Claude returned empty response${detail}`));
             } else {
                 // Inbound: restore aliases → original tokens
                 if (fullText) {

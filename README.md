@@ -147,9 +147,10 @@ For detailed architecture of the dashboard, see [docs/architecture.md](docs/arch
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DASHBOARD_PASS` | No | — | Dashboard password (Basic Auth, user: `admin`) |
-| `OPUS_MODEL` | No | `opus` | CLI model alias for Opus (use `opus[1m]` for 1M context) |
-| `SONNET_MODEL` | No | `sonnet` | CLI model alias for Sonnet (use `sonnet[1m]` for 1M context) |
-| `HAIKU_MODEL` | No | `haiku` | CLI model alias for Haiku |
+| `OPUS_MODEL` | No | `claude-opus-4-6` | Claude CLI model override for `claude-opus-4-6` |
+| `OPUS_47_MODEL` | No | `claude-opus-4-7` | Claude CLI model override for `claude-opus-4-7` |
+| `SONNET_MODEL` | No | `claude-sonnet-4-6` | Claude CLI model override for `claude-sonnet-4-6` |
+| `HAIKU_MODEL` | No | `claude-haiku-4-5` | Claude CLI model override for `claude-haiku-4-5` |
 | `IDLE_TIMEOUT_MS` | No | `120000` | Kill CLI subprocess after this many ms of no output |
 | `OPENCLAW_BRIDGE_PORT` | No | `3456` | API server port |
 | `OPENCLAW_BRIDGE_STATUS_PORT` | No | `3458` | Dashboard port |
@@ -180,18 +181,32 @@ Add this provider to your OpenClaw config (`~/.openclaw/openclaw.json`):
         "api": "openai-completions",
         "models": [
           {
-            "id": "claude-opus-latest",
-            "name": "Claude Opus",
+            "id": "claude-opus-4-7",
+            "name": "Claude Opus 4.7",
             "contextWindow": 1000000,
             "maxTokens": 128000,
             "reasoning": true
           },
           {
-            "id": "claude-sonnet-latest",
-            "name": "Claude Sonnet",
+            "id": "claude-opus-4-6",
+            "name": "Claude Opus 4.6",
+            "contextWindow": 1000000,
+            "maxTokens": 128000,
+            "reasoning": true
+          },
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
             "contextWindow": 1000000,
             "maxTokens": 64000,
             "reasoning": true
+          },
+          {
+            "id": "claude-haiku-4-5",
+            "name": "Claude Haiku 4.5",
+            "contextWindow": 200000,
+            "maxTokens": 8192,
+            "reasoning": false
           }
         ]
       }

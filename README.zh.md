@@ -180,18 +180,32 @@ Dashboard 詳細架構請參閱 [docs/architecture.md](docs/architecture.md#dash
         "api": "openai-completions",
         "models": [
           {
-            "id": "claude-opus-latest",
-            "name": "Claude Opus",
+            "id": "claude-opus-4-7",
+            "name": "Claude Opus 4.7",
             "contextWindow": 1000000,
             "maxTokens": 128000,
             "reasoning": true
           },
           {
-            "id": "claude-sonnet-latest",
-            "name": "Claude Sonnet",
+            "id": "claude-opus-4-6",
+            "name": "Claude Opus 4.6",
+            "contextWindow": 1000000,
+            "maxTokens": 128000,
+            "reasoning": true
+          },
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
             "contextWindow": 1000000,
             "maxTokens": 64000,
             "reasoning": true
+          },
+          {
+            "id": "claude-haiku-4-5",
+            "name": "Claude Haiku 4.5",
+            "contextWindow": 200000,
+            "maxTokens": 8192,
+            "reasoning": false
           }
         ]
       }

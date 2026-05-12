@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const { convertMessages, convertMessagesCompact, extractNewMessages, extractNewUserMessages } = require('./convert');
 const { buildToolInstructions } = require('./tools');
 const { runClaude, getContextWindow, clearSessionAlias } = require('./claude');
+const { cleanResponseText, hasInternalBridgeMarkup, parseToolCallsDetailed, redactSensitivePreview } = require('./tool-parser');
 
 // --- Session cleanup ---
 // Claude CLI subprocess runs with cwd=/tmp. On macOS /tmp → /private/tmp,
@@ -207,6 +208,34 @@ function extractAgentName(messages) {
     return null;
 }
 
+function messageText(msg) {
+    if (!msg) return '';
+    if (typeof msg.content === 'string') return msg.content;
+    if (Array.isArray(msg.content)) {
+        return msg.content
+            .filter(p => p && (p.type === 'text' || typeof p.text === 'string'))
+            .map(p => p.text || '')
+            .join('\n');
+    }
+    return '';
+}
+
+/**
+ * OpenClaw sometimes asks the configured model for a short session filename slug.
+ * That request can include Discord metadata and tools, so if it is proxied into a
+ * per-channel Claude CLI session it poisons the channel: future real prompts resume
+ * a title-generation conversation and Claude replies with the slug forever.
+ * Intercept it before session routing and do not store channelMap/responseMap state.
+ */
+function isSessionTitleSlugRequest(messages) {
+    return messages.some((msg) => {
+        if (msg.role !== 'user') return false;
+        const text = messageText(msg).trim();
+        return /^(?:User:\s*)?Based on this conversation, generate a short 1-2 word filename slug\b/i.test(text)
+            || /generate a short 1-2 word filename slug \(lowercase, hyphen-separated, no file extension\)/i.test(text);
+    });
+}
+
 /**
  * Detect if this is a new OC session (has "✅ New session started" marker
  * as the FIRST assistant/previous_response content, with no other assistant messages we recognise).
@@ -268,63 +297,7 @@ function pushActivity(requestId, msg) {
 // Load persisted state (channelMap, responseMap, requestLog, stats, globalActivity)
 loadState();
 
-/**
- * Parse <tool_call> blocks from Claude's response text.
- * Returns array of { id, name, arguments } or empty array.
- */
-function parseToolCalls(text) {
-    const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-    const calls = [];
-    let match;
-    while ((match = regex.exec(text)) !== null) {
-        const raw = (match[1] || '').trim();
-        const start = raw.indexOf('{');
-        const end = raw.lastIndexOf('}');
-        if (start === -1 || end === -1 || end < start) {
-            console.error(`[parseToolCalls] No JSON object found in block: ${raw.slice(0, 300)}`);
-            continue;
-        }
-        const jsonText = raw.slice(start, end + 1);
-        try {
-            const parsed = JSON.parse(jsonText);
-            if (!parsed || typeof parsed.name !== 'string') {
-                console.error(`[parseToolCalls] Invalid tool_call payload: ${jsonText.slice(0, 300)}`);
-                continue;
-            }
-            const args = (parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments))
-                ? parsed.arguments
-                : {};
-            calls.push({
-                id: `call_${uuidv4().slice(0, 8)}`,
-                name: parsed.name,
-                arguments: args,
-            });
-        } catch (err) {
-            console.error(`[parseToolCalls] Failed to parse JSON: ${jsonText.slice(0, 300)}`);
-        }
-    }
-    return calls;
-}
-
-/**
- * Strip internal XML tags that Claude may echo back from conversation context.
- * These are meant for Claude's consumption, not the end user.
- */
-function cleanResponseText(text) {
-    if (!text) return text;
-    const stripped = text
-        .replace(/<tool_thinking>[\s\S]*?<\/tool_thinking>/g, '')
-        .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
-        .replace(/<tool_result[\s\S]*?<\/tool_result>/g, '')
-        .replace(/<previous_response>[\s\S]*?<\/previous_response>/g, '');
-    // Collapse 3+ newlines only OUTSIDE fenced code blocks, to preserve
-    // intentional formatting inside triple-backtick fences.
-    const parts = stripped.split(/(```[\s\S]*?```)/);
-    return parts
-        .map((part, idx) => idx % 2 === 0 ? part.replace(/\n{3,}/g, '\n\n') : part)
-        .join('')
-        .trim();
-}
+// Tool-call parsing and internal bridge markup cleanup live in ./tool-parser.
 
 // ─── API app (port 3456, localhost only) ──────────────────────────────────────
 const app = express();
@@ -338,9 +311,10 @@ app.get('/v1/models', (req, res) => {
     res.json({
         object: 'list',
         data: [
-            { id: 'claude-opus-latest',   object: 'model', created: 1700000000, owned_by: 'anthropic' },
-            { id: 'claude-sonnet-latest', object: 'model', created: 1700000000, owned_by: 'anthropic' },
-            { id: 'claude-haiku-latest',  object: 'model', created: 1700000000, owned_by: 'anthropic' },
+            { id: 'claude-opus-4-7',   object: 'model', created: 1700000000, owned_by: 'anthropic' },
+            { id: 'claude-opus-4-6',   object: 'model', created: 1700000000, owned_by: 'anthropic' },
+            { id: 'claude-sonnet-4-6', object: 'model', created: 1700000000, owned_by: 'anthropic' },
+            { id: 'claude-haiku-4-5',  object: 'model', created: 1700000000, owned_by: 'anthropic' },
         ],
     });
 });
@@ -387,7 +361,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     pushLog(logEntry); // appear in dashboard immediately as 'pending'
 
     try {
-        const { messages = [], tools = [], model = 'claude-opus-latest', stream = true, reasoning_effort } = req.body;
+        const { messages = [], tools = [], model = 'claude-opus-4-7', stream = true, reasoning_effort, user } = req.body;
         stats.lastModel = model;
         logEntry.model = model;
         logEntry.contextWindow = getContextWindow(model);
@@ -396,8 +370,27 @@ app.post('/v1/chat/completions', async (req, res) => {
         logEntry.thinking = !!reasoning_effort;
         if (reasoning_effort) console.log(`[${requestId}] reasoning_effort=${reasoning_effort}`);
 
+        if (isSessionTitleSlugRequest(messages)) {
+            const promptLen = messages.reduce((s, m) => s + messageText(m).length, 0);
+            console.warn(`[${requestId}] SESSION TITLE intercepted: tools=${tools.length} promptLen≈${promptLen}, returning NO_REPLY without session routing`);
+            logEntry.status = 'ok';
+            logEntry.resumeMethod = 'session_title_intercept';
+            logEntry.promptLen = promptLen;
+            logEntry.durationMs = Date.now() - startTime;
+            pushActivity(requestId, '🏷️ session title intercepted');
+            return res.json({
+                id: `chatcmpl-${requestId}`,
+                object: 'chat.completion',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, message: { role: 'assistant', content: 'NO_REPLY' }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            });
+        }
+
+        const allowedToolNames = new Set(tools.map(t => t.function?.name || t.name).filter(Boolean));
         if (tools.length > 0) {
-            const toolNames = tools.map(t => t.function?.name || t.name).filter(Boolean);
+            const toolNames = Array.from(allowedToolNames);
             console.log(`[${requestId}] tools:[${toolNames.join(',')}]`);
         }
 
@@ -424,41 +417,26 @@ app.post('/v1/chat/completions', async (req, res) => {
             });
         }
 
-        // OC /new startup interception: first request of /new has no metadata, just marker + startup prompt.
-        // Skip creating a CLI session — the real request (with metadata) follows immediately after.
-        if (messages.length <= 4 && !extractConversationLabel(messages) &&
-            messages.some(m => {
-                const c = typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join('') : '';
-                return c.includes('New session started');
-            })) {
-            const nsAgent = extractAgentName(messages);
-            logEntry.agent = nsAgent || null;
-            console.log(`[${requestId}] OC /new startup intercepted (${messages.length} msgs, agent="${nsAgent}"), returning NO_REPLY`);
-            logEntry.status = 'ok';
-            logEntry.resumeMethod = 'newstart';
-            logEntry.promptLen = 0;
-            logEntry.durationMs = Date.now() - startTime;
-            return res.json({
-                id: `chatcmpl-${requestId}`,
-                object: 'chat.completion',
-                created: Math.floor(Date.now() / 1000),
-                model,
-                choices: [{ index: 0, message: { role: 'assistant', content: 'NO_REPLY' }, finish_reason: 'stop' }],
-                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            });
-        }
+        // OC /new startup requests now surface user-visible failures if we return a synthetic
+        // empty stop payload here. Let them flow through to Claude so Forge gets a real first turn.
 
         // --- Session reuse detection ---
         gcMemory();
         let isResume = false;
         let resumeSessionId = null;
 
-        // Extract OC conversation identity + agent name
+        // Extract conversation identity.
+        // Priority:
+        // 1. OpenClaw-style conversation metadata + agent name, for multi-agent channels.
+        // 2. OpenAI-compatible `user` field, for OpenAI clients and raw API tests.
+        // Without the `user` fallback, plain OpenAI requests never hit channelMap and
+        // every turn starts a fresh Claude CLI session.
         const convLabel = extractConversationLabel(messages);
         const agentName = extractAgentName(messages);
+        const openAiUser = typeof user === 'string' && user.trim() ? user.trim() : null;
         const routingKey = convLabel
             ? (agentName ? `${convLabel}::${agentName}` : convLabel)
-            : null;
+            : (openAiUser ? `openai-user:${openAiUser}` : null);
         if (routingKey) {
             console.log(`[${requestId}] OC channel: "${convLabel}" agent: "${agentName || '(none)'}" routingKey: "${routingKey}"`);
         }
@@ -575,6 +553,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                         logEntry.resumeMethod = 'refresh';
                         logEntry.refreshPrompt = compactResult.promptText;
                         logEntry.refreshSystemPrompt = compactResult.systemPrompt;
+                        logEntry.refreshAttachmentBlocks = compactResult.attachmentBlocks || [];
                         logEntry.pendingCompactionHash = compactionHash;
                         purgeCliSession(oldSid);
                         channelMap.delete(routingKey);
@@ -590,6 +569,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         let promptText;
         let combinedSystemPrompt;
         let sessionId;
+        let attachmentBlocks = [];
 
         // Always build system prompt (not persisted in CLI session)
         const { systemPrompt: devSystemPrompt } = convertMessages(messages);
@@ -602,25 +582,41 @@ app.post('/v1/chat/completions', async (req, res) => {
             // Resume mode: only send new messages as prompt
             sessionId = resumeSessionId;
             // 1) Try tool loop extraction (messages after last assistant tool_calls)
-            const newText = extractNewMessages(messages);
+            const newToolLoop = extractNewMessages(messages);
             // 2) Try conversation continuation (messages after last assistant message)
-            const newUserText = !newText ? extractNewUserMessages(messages) : null;
-            if (newText) {
-                promptText = newText;
+            const newCont = !newToolLoop ? extractNewUserMessages(messages) : null;
+            if (newToolLoop) {
+                promptText = newToolLoop.newText;
+                attachmentBlocks = newToolLoop.attachmentBlocks || [];
                 logEntry.resumeMethod = 'tool_loop';
-                console.log(`[${requestId}] RESUME session=${sessionId.slice(0, 8)} newPromptLen=${promptText.length} (tool loop)`);
+                console.log(`[${requestId}] RESUME session=${sessionId.slice(0, 8)} newPromptLen=${promptText.length} (tool loop)${attachmentBlocks.length ? ` +${attachmentBlocks.length} attachment(s)` : ''}`);
                 pushActivity(requestId, `🔄 resuming session (${promptText.length} chars new)`);
-            } else if (newUserText) {
-                promptText = newUserText;
+            } else if (newCont) {
+                promptText = newCont.newText;
+                attachmentBlocks = newCont.attachmentBlocks || [];
                 logEntry.resumeMethod = 'continuation';
-                console.log(`[${requestId}] RESUME session=${sessionId.slice(0, 8)} newPromptLen=${promptText.length} (continuation)`);
+                console.log(`[${requestId}] RESUME session=${sessionId.slice(0, 8)} newPromptLen=${promptText.length} (continuation)${attachmentBlocks.length ? ` +${attachmentBlocks.length} attachment(s)` : ''}`);
                 pushActivity(requestId, `🔄 resuming session (${promptText.length} chars new)`);
+            } else if (routingKey && !messages.some(m => m.role === 'assistant')) {
+                // OpenAI-compatible clients often send only the latest user message
+                // while relying on the `user` routing key for continuity. In that
+                // shape there is no assistant anchor for extractNewUserMessages(),
+                // but we still should resume the mapped Claude CLI session and send
+                // the current user turn.
+                const full = convertMessages(messages);
+                promptText = full.promptText;
+                attachmentBlocks = full.attachmentBlocks || [];
+                logEntry.resumeMethod = 'user_key_continuation';
+                console.log(`[${requestId}] RESUME session=${sessionId.slice(0, 8)} promptLen=${promptText.length} (user key continuation)`);
+                pushActivity(requestId, `🔄 resuming session (${promptText.length} chars via user key)`);
             } else {
                 // Fallback: nothing new to send, use full history as new session
                 logEntry.resumeMethod = 'fallback';
                 isResume = false;
                 sessionId = uuidv4();
-                promptText = convertMessages(messages).promptText;
+                const full = convertMessages(messages);
+                promptText = full.promptText;
+                attachmentBlocks = full.attachmentBlocks || [];
                 console.log(`[${requestId}] RESUME fallback → new session=${sessionId.slice(0, 8)}`);
                 pushActivity(requestId, `⏳ thinking... (${tools.length} tools) [resume fallback]`);
             }
@@ -633,12 +629,16 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (refreshSys) {
                     combinedSystemPrompt = `${refreshSys}${toolInstructions}`;
                 }
+                attachmentBlocks = logEntry.refreshAttachmentBlocks || [];
                 delete logEntry.refreshPrompt;
                 delete logEntry.refreshSystemPrompt;
+                delete logEntry.refreshAttachmentBlocks;
                 console.log(`[${requestId}] NEW session=${sessionId.slice(0, 8)} (context refresh)`);
                 pushActivity(requestId, `🔄 context refresh → new session (${promptText.length} chars)`);
             } else {
-                promptText = convertMessages(messages).promptText;
+                const full = convertMessages(messages);
+                promptText = full.promptText;
+                attachmentBlocks = full.attachmentBlocks || [];
                 console.log(`[${requestId}] NEW session=${sessionId.slice(0, 8)}`);
                 pushActivity(requestId, `⏳ thinking... (${tools.length} tools)`);
             }
@@ -692,33 +692,52 @@ app.post('/v1/chat/completions', async (req, res) => {
         let finalText;
         let finalUsage = { input_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, output_tokens: 0, cost_usd: 0 };
         try {
-            ({ text: finalText, usage: finalUsage } = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, isResume));
+            ({ text: finalText, usage: finalUsage } = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, isResume, attachmentBlocks));
         } catch (err) {
+            const errMessage = err?.message || 'Unknown Claude error';
+            const emptyCompletion = /empty response/i.test(errMessage);
+            const terminatedCompletion = /(^|\b)terminated(\b|$)/i.test(errMessage);
+            const retryableFreshFailure = emptyCompletion || terminatedCompletion;
+            const wasResume = isResume;
+
             // OC disconnected (timeout/restart) — not a CLI error, preserve session
-            if (isResume && err.message === 'Client disconnected') {
+            if (wasResume && errMessage === 'Client disconnected') {
                 console.log(`[${requestId}] OC disconnected, preserving session=${sessionId.slice(0, 8)}`);
                 logEntry.status = 'oc_disconnect';
-                logEntry.error = err.message;
+                logEntry.error = errMessage;
                 logEntry.durationMs = Date.now() - startTime;
                 return;
             }
-            // CLI failed (context overflow, crash, etc.) — retry with compact history
-            if (isResume) {
-                console.warn(`[${requestId}] CLI failed (${err.message}), retrying with compact refresh`);
-                pushActivity(requestId, `⚠ CLI failed, retrying with compact refresh`);
-                logEntry.activity.push(`⚠ CLI failed: ${err.message}`);
+
+            // Retry resume failures with compact refresh, and retry empty/terminated
+            // fresh-session failures once from a new Claude session.
+            if (wasResume || retryableFreshFailure) {
+                const retryLabel = wasResume ? 'compact refresh' : 'fresh session retry';
+                if (retryableFreshFailure) {
+                    const breadcrumb = terminatedCompletion ? '⚠ terminated_completion_retry' : '⚠ empty_completion_retry';
+                    const breadcrumbLog = terminatedCompletion ? 'terminated_completion_retry' : 'empty_completion_retry';
+                    console.warn(`[${requestId}] ${breadcrumbLog}: ${errMessage}`);
+                    pushActivity(requestId, breadcrumb);
+                    logEntry.activity.push(breadcrumb);
+                }
+                console.warn(`[${requestId}] Claude failed (${errMessage}), retrying with ${retryLabel}`);
+                pushActivity(requestId, `⚠ Claude failed, retrying with ${retryLabel}`);
+                logEntry.activity.push(`⚠ Claude failed: ${errMessage}`);
                 isResume = false;
                 sessionId = uuidv4();
-                logEntry.resumeMethod = 'refresh';
-                const compactResult = convertMessagesCompact(messages);
-                promptText = compactResult.promptText;
-                if (compactResult.systemPrompt) {
-                    combinedSystemPrompt = `${compactResult.systemPrompt}${toolInstructions}`;
+                logEntry.resumeMethod = wasResume ? 'refresh' : (terminatedCompletion ? 'retry_terminated' : 'retry_empty');
+                if (wasResume) {
+                    const compactResult = convertMessagesCompact(messages);
+                    promptText = compactResult.promptText;
+                    if (compactResult.systemPrompt) {
+                        combinedSystemPrompt = `${compactResult.systemPrompt}${toolInstructions}`;
+                    }
+                    attachmentBlocks = compactResult.attachmentBlocks || [];
                 }
                 logEntry.promptLen = promptText.length;
-                console.log(`[${requestId}] Compact refresh: new session=${sessionId.slice(0, 8)} promptLen=${promptText.length}`);
+                console.log(`[${requestId}] Retry path: new session=${sessionId.slice(0, 8)} promptLen=${promptText.length}`);
                 try {
-                    ({ text: finalText, usage: finalUsage } = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, false));
+                    ({ text: finalText, usage: finalUsage } = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, false, attachmentBlocks));
                 } catch (retryErr) {
                     console.error(`[${requestId}] Retry also failed: ${retryErr.message}`);
                     logEntry.status = 'error';
@@ -734,16 +753,16 @@ app.post('/v1/chat/completions', async (req, res) => {
                     return;
                 }
             } else {
-                console.error(`[${requestId}] Claude error: ${err.message}`);
+                console.error(`[${requestId}] Claude error: ${errMessage}`);
                 logEntry.status = 'error';
-                logEntry.error = err.message;
+                logEntry.error = errMessage;
                 if (isStream) {
-                    sendChunk(`\n\n[Error: ${err.message}]`);
+                    sendChunk(`\n\n[Error: ${errMessage}]`);
                     sendChunk('', 'stop');
                     res.write('data: [DONE]\n\n');
                     res.end();
                 } else {
-                    res.status(500).json({ error: { message: err.message, type: 'internal_error' } });
+                    res.status(500).json({ error: { message: errMessage, type: 'internal_error' } });
                 }
                 return;
             }
@@ -766,8 +785,20 @@ app.post('/v1/chat/completions', async (req, res) => {
             },
         };
 
-        // Parse <tool_call> blocks from Claude's response
-        const toolCalls = parseToolCalls(finalText || '');
+        // Parse <tool_call> blocks from Claude's response. Exact XML is preferred;
+        // one unambiguous malformed block can be repaired, but only for declared tools.
+        const toolCallResult = parseToolCallsDetailed(finalText || '', { allowedToolNames });
+        const toolCalls = toolCallResult.calls;
+        if (toolCallResult.repaired) {
+            console.warn(`[${requestId}] WARNING malformed_tool_call_repaired close=${toolCallResult.closeTag || 'unknown'} tool=${toolCalls[0]?.name || 'unknown'}`);
+        } else if (toolCallResult.hadToolCallMarkup && toolCalls.length === 0) {
+            console.warn(`[${requestId}] WARNING malformed_tool_call_unrecoverable reason=${toolCallResult.malformedReason || 'unknown'} preview=${redactSensitivePreview(finalText || '')}`);
+        }
+        if (toolCallResult.recoveredJson) {
+            console.warn(`[${requestId}] WARNING malformed_tool_call_json_recovered`);
+        }
+
+        const rawMarkupPresent = hasInternalBridgeMarkup(finalText || '');
 
         if (toolCalls.length > 0) {
             // Claude requested tools → return as OpenAI tool_calls for OC to execute
@@ -784,17 +815,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             console.log(`[${requestId}] sessionMap: stored ${toolCalls.length} tool_call_ids for session=${sessionId.slice(0, 8)} (total=${sessionMap.size})`);
 
             if (isStream) {
-                // Send any text before tool calls
-                if (textBeforeTools) {
-                    const textChunk = {
-                        id: completionId, object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000), model,
-                        choices: [{ index: 0, delta: { role: 'assistant', content: textBeforeTools }, finish_reason: null }],
-                    };
-                    res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
-                }
-
-                // Send tool_calls delta
+                // Suppress any partial assistant prose before tool calls.
+                // Tool-use turns should only surface the tool_calls payload until
+                // the loop completes and a final verified reply is ready.
                 const tcDelta = {
                     id: completionId, object: 'chat.completion.chunk',
                     created: Math.floor(Date.now() / 1000), model,
@@ -832,7 +855,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     created: Math.floor(Date.now() / 1000), model,
                     choices: [{ index: 0, message: {
                         role: 'assistant',
-                        content: textBeforeTools || null,
+                        content: null,
                         tool_calls: toolCalls.map((tc, i) => ({
                             id: tc.id, index: i, type: 'function',
                             function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
@@ -842,8 +865,13 @@ app.post('/v1/chat/completions', async (req, res) => {
                 });
             }
         } else {
-            // No tool calls — return clean text with finish_reason: stop
-            const cleanText = cleanResponseText(finalText);
+            // No tool calls — return clean text with finish_reason: stop.
+            // Fail closed if raw bridge markup somehow survives parsing.
+            let cleanText = cleanResponseText(finalText);
+            if (rawMarkupPresent) {
+                console.warn(`[${requestId}] WARNING suppressed_internal_bridge_markup preview=${redactSensitivePreview(finalText || '')}`);
+                cleanText = '';
+            }
             if (cleanText) sendChunk(cleanText);
 
             if (isStream) {
@@ -956,9 +984,10 @@ statusApp.get('/status', (req, res) => {
             age: Math.floor((Date.now() - val.createdAt) / 1000),
         })),
         contextWindows: {
-            'claude-opus-latest': getContextWindow('claude-opus-latest'),
-            'claude-sonnet-latest': getContextWindow('claude-sonnet-latest'),
-            'claude-haiku-latest': getContextWindow('claude-haiku-latest'),
+            'claude-opus-4-7': getContextWindow('claude-opus-4-7'),
+            'claude-opus-4-6': getContextWindow('claude-opus-4-6'),
+            'claude-sonnet-4-6': getContextWindow('claude-sonnet-4-6'),
+            'claude-haiku-4-5': getContextWindow('claude-haiku-4-5'),
         },
         activity: globalActivity.slice(-30),
         log: [...requestLog].reverse(),
@@ -971,8 +1000,10 @@ statusApp.post('/cleanup', (req, res) => {
     res.json(result);
 });
 
-// SPA fallback — serve index.html for any non-API route
-statusApp.get('*', (req, res) => {
+// SPA fallback — serve index.html for any non-API route. Express 5 uses
+// path-to-regexp v8, where bare '*' is invalid; use middleware as the
+// catch-all instead.
+statusApp.use((req, res) => {
     res.sendFile(path.join(__dirname, '../dashboard/dist/index.html'));
 });
 

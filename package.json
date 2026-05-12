@@ -6,11 +6,12 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
+    "test": "node scripts/test-tool-parser.js",
     "postinstall": "cd dashboard && npm install --ignore-scripts && npm run build"
   },
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "uuid": "^9.0.0"
+    "express": "^5.2.1",
+    "uuid": "^14.0.0"
   }
 }
