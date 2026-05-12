@@ -971,8 +971,10 @@ statusApp.post('/cleanup', (req, res) => {
     res.json(result);
 });
 
-// SPA fallback — serve index.html for any non-API route
-statusApp.get('*', (req, res) => {
+// SPA fallback — serve index.html for any non-API route. Express 5 uses
+// path-to-regexp v8, where bare '*' is invalid; use middleware as the
+// catch-all instead.
+statusApp.use((req, res) => {
     res.sendFile(path.join(__dirname, '../dashboard/dist/index.html'));
 });
 
